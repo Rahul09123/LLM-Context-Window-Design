@@ -1,0 +1,11 @@
+# API keys — never commit this
+.env
+
+# Large data and model files
+data/
+models/
+results/
+__pycache__/
+*.pyc
+.DS_Store
+wandb/
