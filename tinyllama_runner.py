@@ -19,7 +19,7 @@ import logging
 
 import torch
 import yaml
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,30 +71,49 @@ class TinyLlamaRunner:
         self.temperature: float = float(tc.get("temperature", 0.7))
         self.do_sample: bool = bool(tc.get("do_sample", True))
 
-        dtype = torch.float16 if tc["dtype"] == "float16" else torch.float32
-
         logger.info("Loading tokenizer for %s ...", self.model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        logger.info(
-            "Loading model %s (dtype=%s, device_map=%s) ...",
-            self.model_name, tc["dtype"], tc["device_map"],
+        logger.info("Loading model %s in 4-bit NF4 ...", self.model_name)
+        from transformers import BitsAndBytesConfig
+        _bnb_cfg = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
         )
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
-            torch_dtype=dtype,
-            device_map=tc["device_map"],
+            quantization_config=_bnb_cfg,
+            device_map=tc.get("device_map", "auto"),
+            torch_dtype=torch.float16,
         )
         self.model.eval()
 
-        self._pipe = pipeline(
-            "text-generation",
-            model=self.model,
-            tokenizer=self.tokenizer,
-            torch_dtype=dtype,
-            device_map=tc["device_map"],
-        )
+        # _pipe is built lazily via _get_pipe() so that run_phase2 can
+        # inject a pre-loaded model/tokenizer before the pipeline is used.
+        self._pipe = None
         logger.info("TinyLlama model ready.")
+
+    def _get_pipe(self):
+        """Return the HuggingFace pipeline, building it once on first call.
+
+        Lazy construction means that if run_phase2 injects a different model
+        or tokenizer into self.model / self.tokenizer after __init__, the
+        pipeline will be built from the injected versions, not the originals.
+        """
+        if self._pipe is None:
+            from transformers import pipeline as _pipeline
+            self._pipe = _pipeline(
+                "text-generation",
+                model=self.model,
+                tokenizer=self.tokenizer,
+                torch_dtype=torch.float16,
+                device_map="auto",
+            )
+        return self._pipe
 
     def _build_prompt(
         self,
@@ -172,18 +191,88 @@ class TinyLlamaRunner:
 
         prompt = self._build_prompt(system_prompt, context, question)
 
-        outputs = self._pipe(
-            prompt,
-            max_new_tokens=max_new_tokens,
-            do_sample=self.do_sample,
-            temperature=self.temperature,
+        # Use instance max_new_tokens (set from config / overridden externally)
+        # capped at the argument value. Greedy decoding saves memory vs sampling.
+        _tokens = min(max_new_tokens, self.max_new_tokens)
+        _do_sample = self.do_sample and self.temperature > 0.0
+
+        pipe = self._get_pipe()
+        gen_kwargs = dict(
+            max_new_tokens=_tokens,
+            do_sample=_do_sample,
             pad_token_id=self.tokenizer.eos_token_id,
         )
+        if _do_sample:
+            gen_kwargs["temperature"] = self.temperature
+
+        import gc
+        try:
+            outputs = pipe(prompt, **gen_kwargs)
+        finally:
+            gc.collect()
+            torch.cuda.empty_cache()
 
         # Strip the prompt from the generated text
         full_text: str = outputs[0]["generated_text"]
         answer = full_text[len(prompt):].strip()
         return answer
+
+    def generate_batch(
+        self,
+        items: list[tuple[str, str, str]],
+        max_new_tokens: int = 256,
+    ) -> list[str]:
+        """Batched inference for multiple (system_prompt, context, question) tuples.
+
+        Sends all prompts in a single forward pass so the GPU processes a real
+        batch instead of one sample at a time.  Uses left-padding, which is
+        required for decoder-only models like TinyLlama.
+
+        Parameters
+        ----------
+        items : list of (system_prompt, context, question)
+        max_new_tokens : int
+
+        Returns
+        -------
+        list[str]  answers in the same order as ``items``
+        """
+        if not items:
+            return []
+
+        # Decoder-only models need left-padding for batched generation
+        self.tokenizer.padding_side = "left"
+
+        prompts = [
+            self._build_prompt(sys_p or self._DEFAULT_SYSTEM, ctx, q)
+            for sys_p, ctx, q in items
+        ]
+
+        _tokens = min(max_new_tokens, self.max_new_tokens)
+        _do_sample = self.do_sample and self.temperature > 0.0
+
+        pipe = self._get_pipe()
+        gen_kwargs = dict(
+            max_new_tokens=_tokens,
+            do_sample=_do_sample,
+            pad_token_id=self.tokenizer.eos_token_id,
+            # batch_size here controls pipeline chunking, not model batch dim
+            batch_size=min(len(prompts), 4),
+        )
+        if _do_sample:
+            gen_kwargs["temperature"] = self.temperature
+
+        import gc
+        try:
+            outputs = pipe(prompts, **gen_kwargs)
+        finally:
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        return [
+            out[0]["generated_text"][len(prompt):].strip()
+            for prompt, out in zip(prompts, outputs)
+        ]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

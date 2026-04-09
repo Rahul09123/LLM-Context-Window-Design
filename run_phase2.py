@@ -165,7 +165,40 @@ def run_pipeline(
         logger.info("STEP 2 — Training RL compression policy ...")
     logger.info("=" * 50)
 
+    # ── Load TinyLlama once in 4-bit — injected into runner so it does
+    # not trigger a second full fp32 load inside TinyLlamaRunner.__init__
+    import torch as _torch, gc as _gc
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+    _bnb_cfg = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=_torch.float16,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+    )
+    _model_name = cfg["tinyllama"]["model_name"]
+    logger.info("Loading TinyLlama in 4-bit: %s", _model_name)
+    _llm_model = AutoModelForCausalLM.from_pretrained(
+        _model_name,
+        quantization_config=_bnb_cfg,
+        device_map="auto",
+        torch_dtype=_torch.float16,
+    )
+    _llm_model.eval()
+    _llm_tokenizer = AutoTokenizer.from_pretrained(_model_name)
+    if _llm_tokenizer.pad_token is None:
+        _llm_tokenizer.pad_token = _llm_tokenizer.eos_token
+
     runner = TinyLlamaRunner(config_path=config_path)
+    # Overwrite whatever the runner loaded with our 4-bit version
+    for _attr, _obj in [("model", _llm_model), ("tokenizer", _llm_tokenizer),
+                         ("llm", _llm_model), ("tok", _llm_tokenizer)]:
+        if hasattr(runner, _attr):
+            setattr(runner, _attr, _obj)
+    _gc.collect()
+    _torch.cuda.empty_cache()
+    logger.info("Injected 4-bit model into TinyLlamaRunner.")
+
 
     compressor = ContextCompressor(
         w2v_model=w2v,
@@ -194,6 +227,26 @@ def run_pipeline(
     logger.info("=" * 50)
     logger.info("STEP 3 — Running Phase-2 harness evaluation ...")
     logger.info("=" * 50)
+
+    # Aggressive flush between RL training and eval — training leaves
+    # gradient buffers and optimizer states in the reserved pool.
+    import torch as _torch, gc as _gc
+    _gc.collect()
+    if _torch.cuda.is_available():
+        _torch.cuda.empty_cache()
+        _torch.cuda.synchronize()
+        free_mb = _torch.cuda.mem_get_info()[0] / 1e6
+        logger.info("GPU cache cleared before evaluation. Free VRAM: %.0f MB", free_mb)
+
+    # Cap generation length on the runner to reduce activation memory
+    # during the 3 back-to-back generate() calls inside evaluate().
+    for _attr in ("max_new_tokens", "generation_kwargs"):
+        if hasattr(runner, _attr) and _attr == "max_new_tokens":
+            runner.max_new_tokens = min(getattr(runner, _attr, 256), 64)
+    if hasattr(runner, "generation_kwargs") and isinstance(runner.generation_kwargs, dict):
+        runner.generation_kwargs["max_new_tokens"] = 64
+        runner.generation_kwargs.pop("num_beams", None)
+        runner.generation_kwargs["do_sample"] = False
 
     harness = ContextWindowHarness(
         config_path=config_path,

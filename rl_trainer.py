@@ -30,6 +30,7 @@ import logging
 import os
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Optional
 
@@ -181,7 +182,16 @@ class RLTrainer:
             hidden_dim=self.p2cfg["policy_hidden_dim"],
         )
 
-        self._runner = runner or TinyLlamaRunner(config_path=config_path)
+        # Use the pre-loaded runner if provided — avoids loading a second
+        # copy of TinyLlama which would cause OOM on T4 (14.56 GB VRAM).
+        if runner is not None:
+            self._runner = runner
+        else:
+            logger.warning(
+                "No runner provided to RLTrainer — loading TinyLlamaRunner "
+                "internally. Pass runner= from run_phase2 to avoid double load."
+            )
+            self._runner = TinyLlamaRunner(config_path=config_path)
 
         lr = float(self.p2cfg["learning_rate"])
         self.optimizer = optim.Adam(self.compressor.policy.parameters(), lr=lr)
@@ -189,35 +199,64 @@ class RLTrainer:
         self.baseline: float = 5.0          # initial reward baseline (mid-scale)
         self._baseline_alpha: float = float(self.p2cfg["reward_baseline_alpha"])
 
-    # ── Single episode ────────────────────────────────────────────────────────
+    # ── Batched episode ───────────────────────────────────────────────────────
 
-    def _run_episode(self, sample: dict) -> tuple[float, torch.Tensor]:
-        """Run one RL episode.
+    def _run_batch(
+        self, samples: list[dict], batch_size: int
+    ) -> tuple[list[float], list[torch.Tensor]]:
+        """Run a full batch of RL episodes with one batched TinyLlama call.
+
+        Steps
+        -----
+        1. Sample ``batch_size`` random training examples.
+        2. Run ``sample_compress`` on each (CPU — fast Word2Vec + tiny MLP).
+        3. Call ``generate_batch`` once so all prompts share a single GPU
+           forward pass instead of ``batch_size`` separate calls.
+        4. Score all answers in parallel via ``ThreadPoolExecutor`` — the
+           Gemini/OpenAI API calls are network I/O and release the GIL, so
+           true parallelism is achieved without multiprocessing overhead.
 
         Returns
         -------
-        reward : float  RLAIF score [0, 10]
-        log_prob : torch.Tensor  scalar (attached to computation graph)
+        rewards   : list[float]  RLAIF scores [0, 10]
+        log_probs : list[Tensor] scalar tensors attached to compute graph
         """
-        conversation = sample["conversation"]
-        question = sample["question"]
-        gold_answer = sample["gold_answer"]
+        batch_samples = [random.choice(samples) for _ in range(batch_size)]
 
-        # Stochastic context selection
-        context, log_prob = self.compressor.sample_compress(conversation)
+        # Step 1 — stochastic context compression (CPU)
+        contexts: list[str] = []
+        log_probs: list[torch.Tensor] = []
+        questions: list[str] = []
+        gold_answers: list[str] = []
 
-        # TinyLlama answer
-        answer = self._runner.generate(
-            system_prompt=_QA_SYSTEM_PROMPT,
-            context=context,
-            question=question,
+        for s in batch_samples:
+            ctx, lp = self.compressor.sample_compress(s["conversation"])
+            contexts.append(ctx)
+            log_probs.append(lp)
+            questions.append(s["question"])
+            gold_answers.append(s["gold_answer"])
+
+        # Step 2 — single batched TinyLlama forward pass (GPU)
+        _max_new_tokens = getattr(self._runner, "max_new_tokens", 64)
+        _max_new_tokens = min(_max_new_tokens, 64)   # cap to save VRAM
+        answers = self._runner.generate_batch(
+            items=[(_QA_SYSTEM_PROMPT, ctx, q) for ctx, q in zip(contexts, questions)],
+            max_new_tokens=_max_new_tokens,
         )
 
-        # RLAIF reward
-        reward = _rlaif_score(self._llm, question, gold_answer, answer)
-        time.sleep(0.5)   # gentle rate-limit buffer
+        # Step 3 — parallel RLAIF scoring (network I/O — releases GIL)
+        def _score(idx: int) -> tuple[int, float]:
+            r = _rlaif_score(self._llm, questions[idx], gold_answers[idx], answers[idx])
+            time.sleep(0.3)   # gentle per-thread rate-limit buffer
+            return idx, r
 
-        return reward, log_prob
+        rewards: list[float] = [0.0] * batch_size
+        with ThreadPoolExecutor(max_workers=batch_size) as pool:
+            for future in as_completed(pool.submit(_score, i) for i in range(batch_size)):
+                idx, r = future.result()
+                rewards[idx] = r
+
+        return rewards, log_probs
 
     # ── Training loop ─────────────────────────────────────────────────────────
 
@@ -261,29 +300,30 @@ class RLTrainer:
         )
 
         for ep_start in range(0, total_episodes, batch_size):
-            batch_log_probs: list[torch.Tensor] = []
-            batch_rewards: list[float] = []
-
-            for _ in range(batch_size):
-                sample = random.choice(samples)
-                reward, log_prob = self._run_episode(sample)
-                batch_log_probs.append(log_prob)
-                batch_rewards.append(reward)
-
+            batch_rewards, batch_log_probs = self._run_batch(samples, batch_size)
             mean_reward = float(np.mean(batch_rewards))
             episode_rewards.extend(batch_rewards)
 
             # REINFORCE loss over batch
+            # Build loss directly from log_prob tensors so the compute
+            # graph is intact. torch.tensor(0.0) detaches from the graph.
             self.optimizer.zero_grad()
-            loss = torch.tensor(0.0, requires_grad=True)
-            for r, lp in zip(batch_rewards, batch_log_probs):
-                advantage = r - self.baseline
-                loss = loss + (-(advantage * lp) / batch_size)
+            loss_terms = [
+                -(( r - self.baseline) * lp) / batch_size
+                for r, lp in zip(batch_rewards, batch_log_probs)
+            ]
+            loss = torch.stack(loss_terms).sum()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 self.compressor.policy.parameters(), max_norm=1.0
             )
             self.optimizer.step()
+
+            # Flush GPU after each batch — gradient buffers and optimizer
+            # states otherwise accumulate in the reserved pool across episodes.
+            import gc as _gc
+            _gc.collect()
+            torch.cuda.empty_cache()
 
             # Update EMA baseline
             self.baseline = (

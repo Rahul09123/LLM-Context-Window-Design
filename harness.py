@@ -256,7 +256,11 @@ class ContextWindowHarness:
     # ── Context strategies ────────────────────────────────────────────────
 
     def _oracle_context(self, conversation: list[dict]) -> str:
-        """Return the full conversation as context (oracle upper bound).
+        """Return the conversation as context, capped at the model's max input.
+
+        Keeps the most recent tokens so the answer-relevant content (usually
+        near the end) is preserved.  Without a cap, long ShareGPT conversations
+        exceed TinyLlama's 2048-token context and cause CUDA OOM.
 
         Parameters
         ----------
@@ -267,7 +271,11 @@ class ContextWindowHarness:
         -------
         str
         """
-        return _conversation_to_text(conversation)
+        # Leave headroom for the system prompt + question + generated answer.
+        # Reduced from 1536 → 768 to prevent KV-cache OOM when generate()
+        # is called 3× back-to-back inside evaluate().
+        MAX_ORACLE_TOKENS = 768
+        return _truncate_to_tokens(_conversation_to_text(conversation), MAX_ORACLE_TOKENS)
 
     def _baseline_context(self, conversation: list[dict]) -> str:
         """Return a naively truncated context (last N whitespace tokens).
@@ -340,21 +348,34 @@ class ContextWindowHarness:
         compressed_ctx = self._compressed_context(conversation)
 
         # ── Generate answers ────────────────────────────────────────────
+        # Flush GPU cache after every generate() call so KV-cache from
+        # one pass does not stack into the next, causing OOM on T4.
+        import gc
+        import torch
+
         oracle_ans = self._runner.generate(
             system_prompt=self._SYSTEM_PROMPT,
             context=oracle_ctx,
             question=question,
         )
+        gc.collect()
+        torch.cuda.empty_cache()
+
         baseline_ans = self._runner.generate(
             system_prompt=self._SYSTEM_PROMPT,
             context=baseline_ctx,
             question=question,
         )
+        gc.collect()
+        torch.cuda.empty_cache()
+
         compressed_ans = self._runner.generate(
             system_prompt=self._SYSTEM_PROMPT,
             context=compressed_ctx,
             question=question,
         )
+        gc.collect()
+        torch.cuda.empty_cache()
 
         # ── RLAIF scores ────────────────────────────────────────────────
         oracle_score = self._rlaif_score(question, ground_truth, oracle_ans)
@@ -443,7 +464,27 @@ class ContextWindowHarness:
                     "[%d/%d] Evaluating conv=%s | Q: %s ...",
                     idx + 1, len(samples), conv_id, question[:60],
                 )
-                result = self.evaluate(conversation, question, gold)
+                try:
+                    result = self.evaluate(conversation, question, gold)
+                except Exception as exc:
+                    logger.warning(
+                        "Skipping conv=%s question='%s...': %s",
+                        conv_id, question[:40], exc,
+                    )
+                    # Free any leftover GPU memory before continuing
+                    import torch, gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    continue
+
+                # Flush after every successful eval to prevent reserved-but-
+                # unallocated VRAM from accumulating across samples.
+                import torch, gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
                 result.update({
                     "conversation_id": conv_id,
                     "question": question,
