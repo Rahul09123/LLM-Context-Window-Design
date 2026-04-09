@@ -102,7 +102,7 @@ class ContextCompressor:
         w2v_model: Word2Vec,
         token_budget: int = 512,
         hidden_dim: int = 64,
-        device: str = "cpu",
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
     ) -> None:
         self.w2v = w2v_model
         self.embedding_dim: int = w2v_model.vector_size
