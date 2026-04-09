@@ -74,6 +74,7 @@ def _is_valid_turn(turn: dict) -> bool:
 def filter_conversations(
     raw_dataset,
     min_turns: int = 10,
+    max_conversations: int | None = None,
 ) -> list[dict[str, Any]]:
     """Filter the raw dataset to keep only high-quality conversations.
 
@@ -102,6 +103,9 @@ def filter_conversations(
     skipped = 0
 
     for example in raw_dataset:
+        if max_conversations is not None and len(kept) >= max_conversations:
+            break
+
         conv_id = example.get("id", "")
         raw_turns = example.get("conversations", [])
 
@@ -218,7 +222,11 @@ def load_and_prepare(config_path: str = "config.yaml") -> dict[str, list[dict]]:
     raw = raw_ds
 
     # ── 2. Filter ──────────────────────────────────────────────────────────
-    conversations = filter_conversations(raw, min_turns=dc["min_turns"])
+    conversations = filter_conversations(
+        raw,
+        min_turns=dc["min_turns"],
+        max_conversations=dc.get("max_conversations"),
+    )
 
     # ── 3. Split ───────────────────────────────────────────────────────────
     train, val, test = split_data(
