@@ -10,53 +10,70 @@ data:
   data_files:
     - "hf://datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/HTML_cleaned_raw_dataset/sg_90k_part1_html_cleaned.json"
     - "hf://datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/HTML_cleaned_raw_dataset/sg_90k_part2_html_cleaned.json"
-  min_turns: 10                         # filter: keep convs with >= N turns
+  min_turns: 10 # filter: keep convs with >= N turns
+  max_conversations: 300 # cap total kept conversations (set null for no cap)
   train_ratio: 0.80
-  val_ratio:   0.10
-  test_ratio:  0.10
+  val_ratio: 0.10
+  test_ratio: 0.10
   seed: 42
 
-  output_dir:   "data"
-  train_file:   "data/train.json"
-  val_file:     "data/val.json"
-  test_file:    "data/test.json"
-  val_qa_file:  "data/val_qa.json"
+  output_dir: "data"
+  train_file: "data/train.json"
+  val_file: "data/val.json"
+  test_file: "data/test.json"
+  val_qa_file: "data/val_qa.json"
   test_qa_file: "data/test_qa.json"
 
 # ── Word2Vec ───────────────────────────────────
 word2vec:
   vector_size: 200
-  window:      5
-  min_count:   3
-  workers:     4
-  sg:          1                        # 1 = skip-gram
-  epochs:      10
-  model_path:  "models/word2vec.model"
+  window: 5
+  min_count: 3
+  workers: 4
+  sg: 1 # 1 = skip-gram
+  epochs: 10
+  model_path: "models/word2vec.model"
 
 # ── TinyLlama ─────────────────────────────────
 tinyllama:
-  model_name:     "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-  dtype:          "float16"
-  device_map:     "auto"
-  max_new_tokens: 256
-  temperature:    0.7
-  do_sample:      true
+  model_name: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+  dtype: "float16"
+  device_map: "auto"
+  max_new_tokens: 64
+  temperature: 0.7
+  do_sample: true
 
-# ── Claude (RLAIF / QA generation) ────────────
-claude:
-  model:          "claude-haiku-4-5-20251001"
-  max_tokens:     1024
-  qa_per_conv:    3
+# ── LLM (RLAIF / QA generation) ───────────────
+# Swap provider + model + api_key_env to change the backend.
+# Supported providers: anthropic | gemini | openai
+llm:
+  provider: "gemini"
+  model: "gemini-flash-lite-latest"
+  api_key_env: "GEMINI_API_KEY"
+  max_tokens: 1024
+  qa_per_conv: 3
 
 # ── Harness ───────────────────────────────────
 harness:
-  truncation_tokens: 512               # naive baseline window
-  results_dir:       "results"
-  baseline_file:     "results/phase1_baseline.json"
-  eval_sample_size:  100               # val examples to evaluate
+  truncation_tokens: 512 # naive baseline window
+  results_dir: "results"
+  baseline_file: "results/phase1_baseline.json"
+  eval_sample_size: 10 # val examples to evaluate
+
+# ── Phase 2 (RL compression) ──────────────────────
+phase2:
+  rl_episodes: 20 # total training episodes
+  batch_size: 4 # episodes per gradient update
+  learning_rate: 0.001 # Adam learning rate
+  reward_baseline_alpha: 0.1 # EMA alpha for running reward baseline
+  policy_hidden_dim: 64 # hidden layer width in TurnScoringPolicy
+  policy_path: "models/compressor_policy.pt"
+  results_file: "results/phase2_eval.json"
+  eval_sample_size: 10 # val examples for post-training evaluation
+  run_name: "phase2-rl-compressor"
 
 # ── WandB ─────────────────────────────────────
 wandb:
-  project:  "context-window-design"
-  entity:   null                       # set to your wandb username if needed
+  project: "context-window-design"
+  entity: null # set to your wandb username if needed
   run_name: "phase1-baseline"

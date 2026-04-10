@@ -14,15 +14,14 @@ Usage
 
 import json
 import logging
-import os
 import time
 import argparse
 import re
 from pathlib import Path
 from typing import Any
 
-import anthropic
 import yaml
+from llm_client import build_llm_client, LLMClient
 
 logging.basicConfig(
     level=logging.INFO,
@@ -142,67 +141,44 @@ def _extract_json(text: str) -> dict:
 
 
 def generate_qa_for_conversation(
-    client: anthropic.Anthropic,
+    client: LLMClient,
     conversation: list[dict],
-    model: str,
     max_tokens: int,
     n_questions: int,
-    retry_delay: float = 2.0,
-    max_retries: int = 3,
 ) -> list[dict[str, str]]:
-    """Call Claude to generate QA pairs for a single conversation.
+    """Call the configured LLM to generate QA pairs for a single conversation.
 
     Parameters
     ----------
-    client : anthropic.Anthropic
-        Initialised Anthropic API client.
+    client : LLMClient
+        Provider-agnostic LLM client from llm_client.py.
     conversation : list[dict]
         List of turn dicts (with 'from' and 'value').
-    model : str
-        Claude model identifier.
     max_tokens : int
-        Maximum tokens for Claude response.
+        Maximum tokens for the model response.
     n_questions : int
         Number of QA pairs to request.
-    retry_delay : float
-        Seconds to wait between retries on API errors.
-    max_retries : int
-        Maximum number of retry attempts.
 
     Returns
     -------
     list[dict]
         List of dicts with keys 'question' and 'answer'.
-        Returns an empty list if generation fails after all retries.
+        Returns an empty list if generation fails.
     """
     conv_text = _conversation_to_text(conversation)
     user_msg = _QA_USER_TEMPLATE.format(n=n_questions, conversation=conv_text)
 
-    for attempt in range(1, max_retries + 1):
-        try:
-            response = client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                system=_QA_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": user_msg}],
-            )
-            raw_text = response.content[0].text
-            parsed = _extract_json(raw_text)
-            return parsed.get("qa_pairs", [])
+    raw_text = client.complete(system=_QA_SYSTEM_PROMPT, user=user_msg, max_tokens=max_tokens)
+    if not raw_text:
+        logger.error("LLM returned empty response for QA generation.")
+        return []
 
-        except (anthropic.APIError, anthropic.RateLimitError) as exc:
-            logger.warning(
-                "API error on attempt %d/%d: %s", attempt, max_retries, exc
-            )
-            if attempt < max_retries:
-                time.sleep(retry_delay * attempt)
-        except (ValueError, KeyError, json.JSONDecodeError) as exc:
-            logger.warning("Parse error on attempt %d/%d: %s", attempt, max_retries, exc)
-            if attempt < max_retries:
-                time.sleep(retry_delay)
-
-    logger.error("Failed to generate QA for conversation after %d retries.", max_retries)
-    return []
+    try:
+        parsed = _extract_json(raw_text)
+        return parsed.get("qa_pairs", [])
+    except (ValueError, KeyError, json.JSONDecodeError) as exc:
+        logger.warning("Parse error: %s", exc)
+        return []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -234,12 +210,8 @@ def generate_qa_for_split(
         Enriched conversation records with 'qa_pairs' key added.
     """
     cfg = load_config(config_path)
-    claude_cfg = cfg["claude"]
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise EnvironmentError("ANTHROPIC_API_KEY environment variable is not set.")
-
-    client = anthropic.Anthropic(api_key=api_key)
+    llm_cfg = cfg["llm"]
+    client = build_llm_client(llm_cfg)
 
     logger.info("Loading conversations from %s …", input_path)
     with open(input_path, "r", encoding="utf-8") as fh:
@@ -254,9 +226,8 @@ def generate_qa_for_split(
         qa_pairs = generate_qa_for_conversation(
             client=client,
             conversation=record.get("conversations", []),
-            model=claude_cfg["model"],
-            max_tokens=claude_cfg["max_tokens"],
-            n_questions=claude_cfg["qa_per_conv"],
+            max_tokens=llm_cfg["max_tokens"],
+            n_questions=llm_cfg["qa_per_conv"],
         )
 
         enriched.append({**record, "qa_pairs": qa_pairs})
